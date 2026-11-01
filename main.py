@@ -40,7 +40,7 @@ def setup_argparse() -> argparse.ArgumentParser:
     parser.add_argument(
         "--aggregate_data",
         action="store_true",
-        help="Flag to enable aggregation of vulnerability data from external sources (NIST NVD, Exploit-DB).",
+        help="Flag to enable aggregation of vulnerability data from NIST NVD.",
     )
     parser.add_argument(
         "--nvd_api_key",
@@ -75,77 +75,49 @@ def load_data(file_path: str) -> Dict:
         raise
 
 
-def aggregate_vulnerability_data(nvd_api_key: str = None) -> List[Dict]:
+def aggregate_vulnerability_data(nvd_api_key: str = None, cve_ids: List[str] = None) -> List[Dict]:
     """
-    Aggregates vulnerability data from external sources (NIST NVD, Exploit-DB).
-    This is a simplified example.  In a real implementation, you would:
-    1.  Implement robust error handling for network requests.
-    2.  Implement rate limiting to avoid being blocked by APIs.
-    3.  Handle API pagination for large datasets.
-    4.  Implement more sophisticated data extraction and parsing.
+    Queries the NVD API once per supplied CVE ID and reads the CVSS
+    score from the v2 metrics structure.
     """
     vulnerabilities = []
-
-    # NIST NVD (Example - simplified)
-    if nvd_api_key:
-        try:
-            # Replace with actual NVD API endpoint and parameters
-            # This request carries no query at all, so the API returns its first page of everything.
-            # Matching my report against that page is luck, not a lookup by CVE.
-            nvd_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"  # Example endpoint, needs proper parameters
-            headers = {"apiKey": nvd_api_key}
-            response = requests.get(nvd_url, headers=headers, timeout=10)
-
-            if response.status_code == 200:
-                nvd_data = response.json()
-                if "vulnerabilities" in nvd_data:
-                    for item in nvd_data["vulnerabilities"]:
-                        cve_data = item["cve"]
-                        vulnerabilities.append({
-                            "cve_id": cve_data["id"],
-                            "description": cve_data["descriptions"][0]["value"] if cve_data["descriptions"] else "No Description",
-                            "cvssv3": cve_data.get("cvssV3", {}).get("baseScore"), #Optional field, hence the get
-                            "source": "NIST NVD",
-                        })
-                else:
-                    logging.warning("No 'vulnerabilities' found in NVD data.")
-
-            else:
-                logging.error(f"Failed to fetch data from NIST NVD: Status code {response.status_code}")
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Error fetching data from NIST NVD: {e}")
-        except json.JSONDecodeError:
-            logging.error("Error decoding JSON from NIST NVD response.")
-        except Exception as e:
-            logging.error(f"Error processing data from NIST NVD: {e}")
-
-    else:
+    if not nvd_api_key:
         logging.warning("NVD API key not provided. Skipping NIST NVD data aggregation.")
-
-    # Exploit-DB (Example - scraping - very basic, not recommended for production)
-    try:
-        # NOTE: Web scraping is fragile and can break easily.  Use APIs where available.
-        exploitdb_url = "https://www.exploit-db.com/"  # Example URL
-        response = requests.get(exploitdb_url, timeout=10)
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-
-        soup = BeautifulSoup(response.content, "html.parser")
-        # Example: Find all links to exploits (this is highly dependent on the website's structure)
-        # This is a placeholder and needs to be adapted to the actual website structure
-        # exploit_links = soup.find_all("a", href=lambda href: href and "/exploits/" in href)
-        # for link in exploit_links:
-        #     exploit_url = link["href"]
-        #     vulnerabilities.append({
-        #         "cve_id": "N/A",  # Exploit-DB might not always have CVEs
-        #         "description": f"Exploit found: {exploit_url}",
-        #         "source": "Exploit-DB",
-        #     })
-        logging.info("Exploit-DB scraping is placeholder - needs implementation based on website structure")
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching data from Exploit-DB: {e}")
-    except Exception as e:
-        logging.error(f"Error processing data from Exploit-DB: {e}")
-
+        return vulnerabilities
+    headers = {"apiKey": nvd_api_key}
+    for cve_id in (cve_ids or []):
+        try:
+            response = requests.get(
+                "https://services.nvd.nist.gov/rest/json/cves/2.0",
+                headers=headers, params={"cveId": cve_id}, timeout=10)
+            if response.status_code != 200:
+                logging.error(f"Failed to fetch data from NIST NVD for {cve_id}: Status code {response.status_code}")
+                continue
+            nvd_data = response.json()
+            for item in nvd_data.get("vulnerabilities", []):
+                cve_data = item["cve"]
+                cvss_score = None
+                metrics = cve_data.get("metrics") or {}
+                for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                    entries = metrics.get(key) or []
+                    if entries:
+                        cvss_score = (entries[0].get("cvssData") or {}).get("baseScore")
+                        if cvss_score is not None:
+                            break
+                entry = {
+                    "cve_id": cve_data["id"],
+                    "description": cve_data["descriptions"][0]["value"] if cve_data.get("descriptions") else "No Description",
+                    "cvssv3": cvss_score,
+                    "source": "NIST NVD",
+                }
+                for field in ("fixed_version", "target_version"):
+                    if cve_data.get(field):
+                        entry[field] = cve_data[field]
+                vulnerabilities.append(entry)
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error fetching data from NIST NVD for {cve_id}: {e}")
+        except Exception as e:
+            logging.error(f"Error processing NVD data for {cve_id}: {e}")
     return vulnerabilities
 
 
@@ -154,6 +126,10 @@ def correlate_vulnerabilities(
 ) -> List[Dict]:
     """Correlates vulnerabilities from the report with aggregated data."""
     correlated_vulnerabilities = []
+    if not aggregated_vulnerabilities:
+        # Default mode: correlate the report entries directly; the
+        # dependency analysis below works from the report itself.
+        return [dict(vuln) for vuln in vulnerability_report.get("vulnerabilities", []) if vuln.get("cve_id")]
     for vuln in vulnerability_report.get("vulnerabilities", []):
         cve_id = vuln.get("cve_id")
         if cve_id:
@@ -166,51 +142,58 @@ def correlate_vulnerabilities(
     return correlated_vulnerabilities
 
 
+def resolve_fixed_version(vuln: Dict):
+    """Resolves a target version from the report entry or its aggregated record, or None."""
+    for source in (vuln, vuln.get("additional_info") or {}):
+        for field in ("fixed_version", "target_version", "fixedVersion"):
+            value = source.get(field)
+            if value:
+                return str(value)
+    return None
+
 def analyze_dependencies(
     dependency_graph: Dict, correlated_vulnerabilities: List[Dict]
 ) -> Dict:
     """Analyzes dependencies and suggests remediation paths."""
     remediation_suggestions = {}
+    dependencies = dependency_graph.get("dependencies", {})
+    all_listed = set()
+    for deps in dependencies.values():
+        all_listed.update(deps or [])
+    # The application roots are the graph keys that no other package lists.
+    roots = [name for name in dependencies if name not in all_listed]
+    if not roots and dependencies:
+        roots = [next(iter(dependencies))]
+    direct = set()
+    for root in roots:
+        direct.update(dependencies.get(root) or [])
+
     for vuln in correlated_vulnerabilities:
         cve_id = vuln.get("cve_id")
-        affected_package = vuln.get("affected_package")  # Assuming package name is in vulnerability report
-
-        if affected_package:
-            for package, dependencies in dependency_graph.get("dependencies", {}).items():
-                if package == affected_package:
-                    # Suggest upgrading the affected package
-                    new_version = get_latest_version(package)  # Placeholder - implement version fetching
-                    # Suggestions are keyed by CVE alone. Two affected packages sharing one CVE
-                    # overwrite each other here, and only the last survives into the output.
-                    remediation_suggestions[cve_id] = {
-                        "affected_package": affected_package,
-                        "suggestion": f"Upgrade {affected_package} to version {new_version} or later to address CVE: {cve_id}",
-                    }
-                    break
-                else: # Check transitive dependencies
-                         # Transitive here means exactly one hop. A package two levels down gets no
-                         # suggestion, and no path back to the top is ever built, pathfinder name aside.
-                    for dep in dependencies:
-                         if dep == affected_package:
-                            new_version = get_latest_version(affected_package)
-                            remediation_suggestions[cve_id] = {
-                                "affected_package": affected_package,
-                                "suggestion": f"Upgrade transitive dependency {affected_package} to version {new_version} or later to address CVE: {cve_id} by upgrading the top-level dependency: {package}",
-                            }
-                            break # Stop searching transitive deps for current package.
-
+        affected_package = vuln.get("affected_package")
+        if not affected_package or not cve_id:
+            continue
+        version = resolve_fixed_version(vuln)
+        if version:
+            version_text = f"to version {version} or later"
+        else:
+            version_text = "to a fixed version (no version could be resolved from the report or aggregated data, so check the vendor advisory for the first fixed release)"
+        if affected_package in direct:
+            remediation_suggestions[cve_id] = {
+                "affected_package": affected_package,
+                "suggestion": f"Upgrade direct dependency {affected_package} {version_text} to address CVE: {cve_id}",
+            }
+            continue
+        for package, deps in dependencies.items():
+            if package in roots:
+                continue
+            if affected_package in (deps or []):
+                remediation_suggestions[cve_id] = {
+                    "affected_package": affected_package,
+                    "suggestion": f"Upgrade transitive dependency {affected_package} {version_text} to address CVE: {cve_id} by upgrading the dependency that brings it in: {package}",
+                }
+                break
     return remediation_suggestions
-
-
-def get_latest_version(package_name: str) -> str:
-    """Placeholder function to fetch the latest version of a package."""
-    # In a real implementation, this would query a package registry (e.g., PyPI for Python)
-    # For example, using the `requests` library to query the PyPI API:
-    # https://pypi.org/pypi/<package_name>/json
-    # This is just a placeholder. Replace with actual implementation.
-    # Every suggestion sentence is built around this literal word, so a reader who trusts the
-    # output is told to upgrade to a version called latest, which no registry will resolve.
-    return "latest"  # Placeholder
 
 
 def save_output(data: Dict, output_path: str) -> None:
@@ -229,6 +212,13 @@ def main():
     parser = setup_argparse()
     args = parser.parse_args()
 
+    if args.output:
+        from pathlib import Path as _Path
+        out_resolved = _Path(args.output).resolve()
+        for input_path in (args.vulnerability_report, args.dependency_graph):
+            if out_resolved == _Path(input_path).resolve():
+                logging.error(f"Output file {args.output} resolves to an input file ({input_path}); refusing to overwrite it.")
+                sys.exit(1)
     try:
         # Load data from files
         vulnerability_report = load_data(args.vulnerability_report)
@@ -240,7 +230,8 @@ def main():
             if not args.nvd_api_key:
                 logging.error("NVD API key is required when aggregating data. Please provide it using --nvd_api_key.")
                 sys.exit(1)
-            aggregated_vulnerabilities = aggregate_vulnerability_data(args.nvd_api_key)
+            report_cve_ids = [v.get("cve_id") for v in vulnerability_report.get("vulnerabilities", []) if isinstance(v, dict) and v.get("cve_id")]
+            aggregated_vulnerabilities = aggregate_vulnerability_data(args.nvd_api_key, report_cve_ids)
 
         # Correlate vulnerabilities
         # Without aggregation the aggregated list is empty and this correlation can only ever
