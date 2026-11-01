@@ -90,6 +90,8 @@ def aggregate_vulnerability_data(nvd_api_key: str = None) -> List[Dict]:
     if nvd_api_key:
         try:
             # Replace with actual NVD API endpoint and parameters
+            # This request carries no query at all, so the API returns its first page of everything.
+            # Matching my report against that page is luck, not a lookup by CVE.
             nvd_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"  # Example endpoint, needs proper parameters
             headers = {"apiKey": nvd_api_key}
             response = requests.get(nvd_url, headers=headers, timeout=10)
@@ -178,12 +180,16 @@ def analyze_dependencies(
                 if package == affected_package:
                     # Suggest upgrading the affected package
                     new_version = get_latest_version(package)  # Placeholder - implement version fetching
+                    # Suggestions are keyed by CVE alone. Two affected packages sharing one CVE
+                    # overwrite each other here, and only the last survives into the output.
                     remediation_suggestions[cve_id] = {
                         "affected_package": affected_package,
                         "suggestion": f"Upgrade {affected_package} to version {new_version} or later to address CVE: {cve_id}",
                     }
                     break
                 else: # Check transitive dependencies
+                         # Transitive here means exactly one hop. A package two levels down gets no
+                         # suggestion, and no path back to the top is ever built, pathfinder name aside.
                     for dep in dependencies:
                          if dep == affected_package:
                             new_version = get_latest_version(affected_package)
@@ -202,6 +208,8 @@ def get_latest_version(package_name: str) -> str:
     # For example, using the `requests` library to query the PyPI API:
     # https://pypi.org/pypi/<package_name>/json
     # This is just a placeholder. Replace with actual implementation.
+    # Every suggestion sentence is built around this literal word, so a reader who trusts the
+    # output is told to upgrade to a version called latest, which no registry will resolve.
     return "latest"  # Placeholder
 
 
@@ -235,6 +243,8 @@ def main():
             aggregated_vulnerabilities = aggregate_vulnerability_data(args.nvd_api_key)
 
         # Correlate vulnerabilities
+        # Without aggregation the aggregated list is empty and this correlation can only ever
+        # be empty too. The default run prints an empty object and exits 0.
         correlated_vulnerabilities = correlate_vulnerabilities(
             vulnerability_report, aggregated_vulnerabilities
         )
