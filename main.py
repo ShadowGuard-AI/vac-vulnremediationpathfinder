@@ -6,10 +6,9 @@ from typing import Dict, List, Tuple
 
 try:
     import requests
-    from bs4 import BeautifulSoup
     import yaml
 except ImportError as e:
-    print(f"Error importing dependencies: {e}. Please install them (e.g., pip install requests beautifulsoup4 pyyaml)")
+    print(f"Error importing dependencies: {e}. Please install them (e.g., pip install requests pyyaml)")
     sys.exit(1)
 
 # Configure logging
@@ -78,7 +77,8 @@ def load_data(file_path: str) -> Dict:
 def aggregate_vulnerability_data(nvd_api_key: str = None, cve_ids: List[str] = None) -> List[Dict]:
     """
     Queries the NVD API once per supplied CVE ID and reads the CVSS
-    score from the v2 metrics structure.
+    base score from the first available metrics family, in the order
+    CVSS v3.1, CVSS v3.0, then CVSS v2.
     """
     vulnerabilities = []
     if not nvd_api_key:
@@ -126,11 +126,18 @@ def correlate_vulnerabilities(
 ) -> List[Dict]:
     """Correlates vulnerabilities from the report with aggregated data."""
     correlated_vulnerabilities = []
+    entries = vulnerability_report.get("vulnerabilities", [])
+    if not isinstance(entries, list):
+        raise ValueError("The vulnerability report 'vulnerabilities' field must be a list.")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            logging.warning(f"Skipping a vulnerability entry that is not an object: {entry!r}")
+    entries = [entry for entry in entries if isinstance(entry, dict)]
     if not aggregated_vulnerabilities:
         # Default mode: correlate the report entries directly; the
         # dependency analysis below works from the report itself.
-        return [dict(vuln) for vuln in vulnerability_report.get("vulnerabilities", []) if vuln.get("cve_id")]
-    for vuln in vulnerability_report.get("vulnerabilities", []):
+        return [dict(vuln) for vuln in entries if vuln.get("cve_id")]
+    for vuln in entries:
         cve_id = vuln.get("cve_id")
         if cve_id:
             for agg_vuln in aggregated_vulnerabilities:
@@ -178,21 +185,34 @@ def analyze_dependencies(
             version_text = f"to version {version} or later"
         else:
             version_text = "to a fixed version (no version could be resolved from the report or aggregated data, so check the vendor advisory for the first fixed release)"
+        # One CVE can affect several packages. Keep the plain CVE key for
+        # the first package and qualify later keys so no suggestion is
+        # silently overwritten.
+        key = cve_id
+        if key in remediation_suggestions:
+            key = f"{cve_id} [{affected_package}]"
         if affected_package in direct:
-            remediation_suggestions[cve_id] = {
+            remediation_suggestions[key] = {
                 "affected_package": affected_package,
                 "suggestion": f"Upgrade direct dependency {affected_package} {version_text} to address CVE: {cve_id}",
             }
             continue
+        placed = False
         for package, deps in dependencies.items():
             if package in roots:
                 continue
             if affected_package in (deps or []):
-                remediation_suggestions[cve_id] = {
+                remediation_suggestions[key] = {
                     "affected_package": affected_package,
                     "suggestion": f"Upgrade transitive dependency {affected_package} {version_text} to address CVE: {cve_id} by upgrading the dependency that brings it in: {package}",
                 }
+                placed = True
                 break
+        if not placed:
+            remediation_suggestions[key] = {
+                "affected_package": affected_package,
+                "suggestion": f"Upgrade {affected_package} {version_text} to address CVE: {cve_id} (this package was not found in the dependency graph, so whether it is direct or transitive could not be determined)",
+            }
     return remediation_suggestions
 
 
@@ -223,6 +243,12 @@ def main():
         # Load data from files
         vulnerability_report = load_data(args.vulnerability_report)
         dependency_graph = load_data(args.dependency_graph)
+        if not isinstance(vulnerability_report, dict):
+            raise ValueError("The vulnerability report must be a JSON or YAML object.")
+        if not isinstance(dependency_graph, dict):
+            raise ValueError("The dependency graph must be a JSON or YAML object.")
+        if not isinstance(dependency_graph.get("dependencies", {}), dict):
+            raise ValueError("The dependency graph 'dependencies' field must be an object mapping package names to lists.")
 
         # Aggregate vulnerability data if requested
         aggregated_vulnerabilities = []
@@ -233,9 +259,8 @@ def main():
             report_cve_ids = [v.get("cve_id") for v in vulnerability_report.get("vulnerabilities", []) if isinstance(v, dict) and v.get("cve_id")]
             aggregated_vulnerabilities = aggregate_vulnerability_data(args.nvd_api_key, report_cve_ids)
 
-        # Correlate vulnerabilities
-        # Without aggregation the aggregated list is empty and this correlation can only ever
-        # be empty too. The default run prints an empty object and exits 0.
+        # Correlate vulnerabilities. Without aggregation, correlation
+        # works from the report entries directly.
         correlated_vulnerabilities = correlate_vulnerabilities(
             vulnerability_report, aggregated_vulnerabilities
         )
